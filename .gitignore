@@ -12,6 +12,10 @@
 .swiftpm/
 migrate_working_dir/
 
+# Development scripts (not for production)
+*.py
+*.vbs
+
 # IntelliJ related
 *.iml
 *.ipr
