@@ -25,10 +25,11 @@ class HomeScreen extends StatefulWidget {
   });
 
   @override
-  State<HomeScreen> createState() => _HomeScreenState();
+  State<HomeScreen> createState() => HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+/// HomeScreen 的 State 类（公开以便 main.dart 访问）
+class HomeScreenState extends State<HomeScreen> {
   late TaskConfig _config;
   String _currentIcon = 'cat'; // 主界面图标，从配置读取
   bool _loading = true;
@@ -40,15 +41,34 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     // 设置通知服务的上下文（HomeScreen 是第一个显示的页面）
     NotificationService.setContext(context);
-    
+
     _config = TaskConfig();
     _init();
     widget.scheduler.onStatusChanged(_refresh);
+    
+    // 倒计时定时器：仅在有活跃任务且窗口可见时更新 UI
     _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted && widget.scheduler.hasActiveTask) {
         setState(() {});
       }
     });
+  }
+  
+  /// 暂停倒计时定时器（窗口隐藏时调用）
+  void pauseCountdownTimer() {
+    _countdownTimer?.cancel();
+    _countdownTimer = null;
+  }
+  
+  /// 恢复倒计时定时器（窗口显示时调用）
+  void resumeCountdownTimer() {
+    if (_countdownTimer == null) {
+      _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted && widget.scheduler.hasActiveTask) {
+          setState(() {});
+        }
+      });
+    }
   }
 
   void _refresh() {

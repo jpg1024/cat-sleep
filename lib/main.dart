@@ -123,6 +123,7 @@ class CatSleepApp extends StatefulWidget {
 
 class _CatSleepAppState extends State<CatSleepApp> with TrayListener, WindowListener {
   final SchedulerService _scheduler = SchedulerService();
+  HomeScreenState? _homeScreen; // 保存 HomeScreen 引用以控制定时器
   bool _isDarkMode = false;
 
   @override
@@ -179,11 +180,27 @@ class _CatSleepAppState extends State<CatSleepApp> with TrayListener, WindowList
   @override
   void onWindowMinimize() {
     windowManager.hide();
+    // 窗口隐藏时暂停倒计时定时器
+    _homeScreen?.pauseCountdownTimer();
   }
 
   @override
   void onWindowClose() {
     windowManager.hide();
+    // 窗口关闭时暂停倒计时定时器
+    _homeScreen?.pauseCountdownTimer();
+  }
+  
+  @override
+  void onWindowBlur() {
+    // 窗口失去焦点（被其他窗口遮住）时暂停倒计时
+    _homeScreen?.pauseCountdownTimer();
+  }
+  
+  @override
+  void onWindowFocus() {
+    // 窗口获得焦点时恢复倒计时
+    _homeScreen?.resumeCountdownTimer();
   }
 
   @override
@@ -214,12 +231,14 @@ class _CatSleepAppState extends State<CatSleepApp> with TrayListener, WindowList
         exit(0);
     }
   }
-
+  
+  /// 显示窗口并恢复倒计时定时器
   Future<void> _showWindow() async {
     await windowManager.show();
     await windowManager.focus();
     await windowManager.setAlwaysOnTop(true);
     await windowManager.setAlwaysOnTop(false);
+    // 窗口显示时恢复倒计时定时器（onWindowFocus 会自动触发）
   }
 
   @override
@@ -237,10 +256,21 @@ class _CatSleepAppState extends State<CatSleepApp> with TrayListener, WindowList
       theme: AppTheme.lightTheme,
       darkTheme: AppTheme.darkTheme,
       themeMode: _isDarkMode ? ThemeMode.dark : ThemeMode.light,
-      home: HomeScreen(
-        scheduler: _scheduler,
-        onThemeToggle: _toggleTheme,
-        isDarkMode: _isDarkMode,
+      home: Builder(
+        builder: (context) {
+          // 使用 Builder 获取 HomeScreen 的 State
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            final homeScreenState = context.findAncestorStateOfType<HomeScreenState>();
+            if (homeScreenState != null) {
+              _homeScreen = homeScreenState;
+            }
+          });
+          return HomeScreen(
+            scheduler: _scheduler,
+            onThemeToggle: _toggleTheme,
+            isDarkMode: _isDarkMode,
+          );
+        },
       ),
     );
   }
