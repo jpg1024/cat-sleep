@@ -100,24 +100,29 @@ class HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _init() async {
-    // 从配置读取主界面图标（顶部 AppBar + 中部 StatusCard）
-    final icon = await IconService.getCurrentIcon();
-    setState(() => _currentIcon = icon);
+    try {
+      // 从配置读取主界面图标（顶部 AppBar + 中部 StatusCard）
+      final icon = await IconService.getCurrentIcon();
+      setState(() => _currentIcon = icon);
 
-    final savedConfig = await StorageService.loadTaskConfig();
-    if (savedConfig != null) {
-      await LogService.write(
-        '[HomeScreen] Restoring task: type=${savedConfig.taskType.name}, '
-        'mode=${savedConfig.scheduleMode.name}, targetTime=${savedConfig.targetTime}',
-      );
-      _config = savedConfig;
-      await widget.scheduler.restoreFromConfig(_config);
-      await _loadNextExecutions();
-    } else {
-      await LogService.write('[HomeScreen] No saved task config, scheduler idle');
+      final savedConfig = await StorageService.loadTaskConfig();
+      if (savedConfig != null) {
+        await LogService.write(
+          '[HomeScreen] Restoring task: type=${savedConfig.taskType.name}, '
+          'mode=${savedConfig.scheduleMode.name}, targetTime=${savedConfig.targetTime}',
+        );
+        _config = savedConfig;
+        await widget.scheduler.restoreFromConfig(_config);
+        await _loadNextExecutions();
+      } else {
+        await LogService.write('[HomeScreen] No saved task config, scheduler idle');
+      }
+    } catch (e, stackTrace) {
+      await LogService.write('[HomeScreen] _init failed: $e\n$stackTrace');
+    } finally {
+      // 无论成功或异常，都必须结束 loading 状态
+      if (mounted) setState(() => _loading = false);
     }
-
-    setState(() => _loading = false);
   }
 
   Future<void> _openCreateTask() async {

@@ -353,8 +353,18 @@ class SchedulerService {
   }
 
   /// 从配置恢复任务
+  ///
+  /// 恢复失败时不抛异常——主界面必须能正常显示，即使任务无法恢复。
   Future<void> restoreFromConfig(TaskConfig config) async {
-    await startTask(config);
+    try {
+      await startTask(config);
+    } catch (e, stackTrace) {
+      await LogService.write(
+        '[SchedulerService] restoreFromConfig failed: $e\n$stackTrace',
+      );
+      _currentConfig = null;
+      _nextTriggerTime = null;
+    }
   }
 
   /// 设置变更（如提前提醒分钟数）后按当前执行时间重新装载定时器
