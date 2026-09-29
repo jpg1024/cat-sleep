@@ -196,13 +196,13 @@ class _CatSleepAppState extends State<CatSleepApp> with TrayListener, WindowList
 
   @override
   void onWindowBlur() {
-    // 窗口失去焦点（被其他窗口遮住）时暂停倒计时
-    _homeScreen?.pauseCountdownTimer();
+    // 窗口被其他应用遮住时不暂停——只要窗口没有最小化/隐藏，
+    // 倒计时就持续刷新，确保用户切回时看到最新状态。
   }
 
   @override
   void onWindowFocus() {
-    // 窗口获得焦点时恢复倒计时
+    // 窗口获得焦点时确保定时器运行（兜底）
     _homeScreen?.resumeCountdownTimer();
   }
 

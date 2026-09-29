@@ -34,6 +34,7 @@ class HomeScreenState extends State<HomeScreen> {
   String _currentIcon = 'cat'; // 主界面图标，从配置读取
   bool _loading = true;
   Timer? _countdownTimer;
+  Timer? _safetyTimer; // 每 30 分钟兜底恢复倒计时
   List<DateTime> _nextExecutions = [];
 
   @override
@@ -45,12 +46,17 @@ class HomeScreenState extends State<HomeScreen> {
     _config = TaskConfig();
     _init();
     widget.scheduler.onStatusChanged(_refresh);
-    
-    // 倒计时定时器：仅在有活跃任务且窗口可见时更新 UI
+
+    // 倒计时定时器：每秒刷新 UI
     _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted && widget.scheduler.hasActiveTask) {
         setState(() {});
       }
+    });
+
+    // 安全兜底：每 30 分钟检查一次，确保倒计时定时器在运行
+    _safetyTimer = Timer.periodic(const Duration(minutes: 30), (_) {
+      resumeCountdownTimer();
     });
   }
   
@@ -314,6 +320,7 @@ class HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _countdownTimer?.cancel();
+    _safetyTimer?.cancel();
     super.dispose();
   }
 
