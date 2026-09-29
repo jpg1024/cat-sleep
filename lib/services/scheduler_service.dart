@@ -171,7 +171,8 @@ class SchedulerService {
     await LogService.write(
       '[SchedulerService] Task armed: type=${config.taskType.name}, '
       'mode=${config.scheduleMode.name}, next=$nextTime '
-      '(in ${duration.inMinutes} min)',
+      '(in ${duration.inMinutes} min'
+      '${_reminderTimer != null ? ", pre-reminder ${config.reminderMinutes}min before" : ""})',
     );
 
     _onStatusChanged?.call();
@@ -198,19 +199,10 @@ class SchedulerService {
 
     final lead = Duration(minutes: config.reminderMinutes);
     if (duration <= lead) {
-      // 距离执行已不足提醒提前量，再装就会立刻弹或弹在过去
-      LogService.write(
-        '[SchedulerService] Pre-reminder skipped: only ${duration.inMinutes} min '
-        'until execution, lead is ${config.reminderMinutes} min',
-      );
       return;
     }
 
     _reminderTimer = Timer(duration - lead, () => _firePreReminder(config, nextTime));
-    LogService.write(
-      '[SchedulerService] Pre-reminder armed: ${config.reminderMinutes} min '
-      'before $nextTime',
-    );
   }
 
   /// 触发提前提醒
