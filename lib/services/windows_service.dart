@@ -102,18 +102,6 @@ class WindowsService {
     return result ?? false;
   }
 
-  /// 显示系统通知
-  static Future<void> showNotification(String title, String body) async {
-    try {
-      await _channel.invokeMethod('showNotification', {
-        'title': title,
-        'body': body,
-      });
-    } catch (e) {
-      print('Failed to show notification: $e');
-    }
-  }
-
   /// 执行任务
   static Future<void> executeTask(String method) async {
     switch (method) {

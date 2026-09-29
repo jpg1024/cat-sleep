@@ -1,13 +1,19 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../models/task_config.dart';
+import 'log_service.dart';
+import 'notification_service.dart';
 import 'windows_service.dart';
 import 'workday_service.dart';
 
 /// 定时调度引擎
 /// 单任务模式：全局只维护一个活跃 Timer
 class SchedulerService {
+  /// 推算下次执行时间时的最大步数，防止配置自相矛盾时死循环
+  static const int _maxSearchSteps = 500;
+
   Timer? _timer;
+  Timer? _reminderTimer;
   TaskConfig? _currentConfig;
   DateTime? _nextTriggerTime;
   DateTime _taskStartTime = DateTime.now();
@@ -25,7 +31,15 @@ class SchedulerService {
   DateTime? get nextTriggerTime => _nextTriggerTime;
 
   /// 是否有活跃任务
-  bool get hasActiveTask => _timer != null && _currentConfig != null;
+  ///
+  /// 以 `_currentConfig` 为准：周期任务执行后即使定时器尚未重新装载
+  /// （如 _reschedule 暂未找到下次时间），任务仍应视为"活跃"，
+  /// 保证主界面时间线不消失。
+  bool get hasActiveTask => _currentConfig != null;
+
+  /// 是否已装载"提前提醒"定时器
+  @visibleForTesting
+  bool get hasPendingPreReminder => _reminderTimer != null;
 
   /// 计算下次触发时间
   Future<DateTime?> _calculateNextTrigger(TaskConfig config) async {
@@ -36,24 +50,20 @@ class SchedulerService {
         if (config.targetTime == null) return null;
         var target = config.targetTime!;
 
-        // 根据频率调整
-        if (config.frequency == Frequency.weekly) {
-          // 找到下一个匹配的星期几
-          while (target.isBefore(now) || !await _shouldExecute(target, config)) {
-            target = target.add(const Duration(days: 7));
+        // 按频率逐步推进；带步数上限，避免"每周但未勾选该星期几"这类
+        // 矛盾配置让循环永不退出（会永久卡住 startTask）
+        for (int step = 0; step < _maxSearchSteps; step++) {
+          if (!target.isBefore(now) && await _shouldExecute(target, config)) {
+            return target;
           }
-        } else if (config.frequency == Frequency.monthly) {
-          // 找到下一个匹配的日期
-          while (target.isBefore(now) || !await _shouldExecute(target, config)) {
-            target = DateTime(target.year, target.month + 1, config.monthlyDay ?? target.day, target.hour, target.minute);
-          }
-        } else {
-          // 每天
-          while (target.isBefore(now) || !await _shouldExecute(target, config)) {
-            target = target.add(const Duration(days: 1));
-          }
+          target = _advance(target, config);
         }
-        return target;
+        await LogService.write(
+          '[SchedulerService] No valid execution time within $_maxSearchSteps steps '
+          '(frequency=${config.frequency.name}, weekDays=${config.weekDays}, '
+          'workdayOnly=${config.workdayOnly})',
+        );
+        return null;
 
       case ScheduleMode.countdown:
         return now.add(Duration(
@@ -74,10 +84,32 @@ class SchedulerService {
         }
         // 否则逐天后移寻找满足条件的日期
         target = target.add(const Duration(days: 1));
-        while (!await _isWorkdayTriggerDay(target, config)) {
+        for (int step = 0; step < _maxSearchSteps; step++) {
+          if (await _isWorkdayTriggerDay(target, config)) return target;
           target = target.add(const Duration(days: 1));
         }
-        return target;
+        await LogService.write(
+          '[SchedulerService] No workday trigger day within $_maxSearchSteps days',
+        );
+        return null;
+    }
+  }
+
+  /// 按频率把候选时间推进到下一个周期
+  DateTime _advance(DateTime target, TaskConfig config) {
+    switch (config.frequency) {
+      case Frequency.weekly:
+        return target.add(const Duration(days: 7));
+      case Frequency.monthly:
+        return DateTime(
+          target.year,
+          target.month + 1,
+          config.monthlyDay ?? target.day,
+          target.hour,
+          target.minute,
+        );
+      case Frequency.daily:
+        return target.add(const Duration(days: 1));
     }
   }
 
@@ -106,14 +138,19 @@ class SchedulerService {
   /// 启动任务
   Future<void> startTask(TaskConfig config) async {
     // 先取消旧任务（不触发状态回调）
-    _timer?.cancel();
-    _timer = null;
+    _cancelTimers();
 
     _currentConfig = config;
     _taskStartTime = DateTime.now();
     final nextTime = await _calculateNextTrigger(config);
 
     if (nextTime == null) {
+      await LogService.write(
+        '[SchedulerService] startTask aborted: no next trigger time '
+        '(type=${config.taskType.name}, mode=${config.scheduleMode.name})',
+      );
+      _currentConfig = null;
+      _nextTriggerTime = null;
       _onStatusChanged?.call();
       return;
     }
@@ -122,49 +159,174 @@ class SchedulerService {
     final duration = nextTime.difference(DateTime.now());
 
     if (duration.isNegative) {
-      _onStatusChanged?.call();
-      return;
-    }
-
-    _timer = Timer(duration, () async {
-      await _executeTask();
-    });
-
-    _onStatusChanged?.call();
-  }
-
-  /// 执行任务
-  Future<void> _executeTask() async {
-    if (_currentConfig == null) return;
-
-    final config = _currentConfig!;
-
-    // 特殊处理提醒类型
-    if (config.taskType == TaskType.remind) {
-      // 发送系统通知
-      final text = config.reminderText != null && config.reminderText!.isNotEmpty
-          ? config.reminderText!
-          : '定时提醒时间到！';
-      await WindowsService.showNotification('猫猫睡觉提醒', text);
-      
-      // 提醒类型不执行关机操作，直接重置
-      _timer = null;
+      await LogService.write('[SchedulerService] startTask aborted: next trigger $nextTime is in the past');
       _currentConfig = null;
       _nextTriggerTime = null;
       _onStatusChanged?.call();
       return;
     }
 
-    // 发送提醒（其他类型的提前提醒）
-    if (config.reminderEnabled && config.reminderMinutes > 0) {
-      // TODO: 显示提醒通知
+    _armTimers(config, nextTime);
+
+    await LogService.write(
+      '[SchedulerService] Task armed: type=${config.taskType.name}, '
+      'mode=${config.scheduleMode.name}, next=$nextTime '
+      '(in ${duration.inMinutes} min)',
+    );
+
+    _onStatusChanged?.call();
+  }
+
+  /// 是否需要提前提醒（提醒类型本身就是提醒，不再叠加）
+  bool _shouldPreRemind(TaskConfig config) =>
+      config.taskType != TaskType.remind &&
+      config.reminderEnabled &&
+      config.reminderMinutes > 0;
+
+  /// 装载执行定时器，并按需装载提前提醒定时器
+  void _armTimers(TaskConfig config, DateTime nextTime) {
+    final now = DateTime.now();
+    var duration = nextTime.difference(now);
+    if (duration.isNegative) duration = Duration.zero;
+
+    _timer = Timer(duration, () async => _executeTask());
+
+    _reminderTimer?.cancel();
+    _reminderTimer = null;
+
+    if (!_shouldPreRemind(config)) return;
+
+    final lead = Duration(minutes: config.reminderMinutes);
+    if (duration <= lead) {
+      // 距离执行已不足提醒提前量，再装就会立刻弹或弹在过去
+      LogService.write(
+        '[SchedulerService] Pre-reminder skipped: only ${duration.inMinutes} min '
+        'until execution, lead is ${config.reminderMinutes} min',
+      );
+      return;
+    }
+
+    _reminderTimer = Timer(duration - lead, () => _firePreReminder(config, nextTime));
+    LogService.write(
+      '[SchedulerService] Pre-reminder armed: ${config.reminderMinutes} min '
+      'before $nextTime',
+    );
+  }
+
+  /// 触发提前提醒
+  Future<void> _firePreReminder(TaskConfig config, DateTime triggerTime) async {
+    _reminderTimer = null;
+    final hh = triggerTime.hour.toString().padLeft(2, '0');
+    final mm = triggerTime.minute.toString().padLeft(2, '0');
+    final message = '将在 ${config.reminderMinutes} 分钟后（$hh:$mm）'
+        '执行「${config.taskType.label}」';
+
+    await LogService.write('[SchedulerService] Pre-reminder fired: $message');
+
+    try {
+      await NotificationService.showNotification(title: '猫猫睡觉提醒', message: message);
+    } catch (e, stackTrace) {
+      // 提前提醒失败不能影响真正的任务执行
+      await LogService.write('[SchedulerService] Pre-reminder failed: $e\n$stackTrace');
+    }
+  }
+
+  /// 只取消定时器，不动任务状态
+  void _cancelTimers() {
+    _timer?.cancel();
+    _timer = null;
+    _reminderTimer?.cancel();
+    _reminderTimer = null;
+  }
+
+  /// 该配置是否为周期任务（执行后需要重新排期）
+  bool _isRecurring(TaskConfig config) {
+    if (config.taskType == TaskType.remind) return false;
+    return config.scheduleMode == ScheduleMode.workday ||
+        config.scheduleMode == ScheduleMode.specificTime;
+  }
+
+  /// 立即执行当前任务（与定时器触发走完全相同的路径）
+  ///
+  /// 仅供测试驱动，避免测试依赖真实 Timer 等待。
+  @visibleForTesting
+  Future<void> debugExecuteTask() => _executeTask();
+
+  /// 执行任务
+  Future<void> _executeTask() async {
+    if (_currentConfig == null) return;
+
+    final config = _currentConfig!;
+    // 执行时间已到，提前提醒不再有意义的情况（提前量为 0 或被跳过）
+    _reminderTimer?.cancel();
+    _reminderTimer = null;
+
+    await LogService.write(
+      '[SchedulerService] Task fired: type=${config.taskType.name}, '
+      'scheduled=$_nextTriggerTime',
+    );
+
+    // 特殊处理提醒类型
+    if (config.taskType == TaskType.remind) {
+      final text = config.reminderText != null && config.reminderText!.isNotEmpty
+          ? config.reminderText!
+          : '定时提醒时间到！';
+      // 走 NotificationService，保证托盘/最小化状态下也能强制弹出
+      await NotificationService.showNotification(title: '猫猫睡觉提醒', message: text);
+      _clearTask();
+      return;
     }
 
     // 执行系统操作（关机/重启等）
-    await WindowsService.executeTask(config.taskType.method);
+    try {
+      await WindowsService.executeTask(config.taskType.method);
+      await LogService.write('[SchedulerService] Executed: ${config.taskType.method}');
+    } catch (e, stackTrace) {
+      await LogService.write(
+        '[SchedulerService] Failed to execute ${config.taskType.method}: $e\n$stackTrace',
+      );
+    }
 
-    // 任务完成后重置状态
-    _timer = null;
+    // 周期任务重新排期，一次性任务清空状态
+    if (_isRecurring(config)) {
+      await _reschedule(config);
+    } else {
+      _clearTask();
+    }
+  }
+
+  /// 为周期任务排下一次执行
+  ///
+  /// 周期任务（workday / specificTime）执行后必须保留任务状态，
+  /// 即使暂时找不到下次执行时间也不能 `_clearTask()`——任务配置
+  /// 仍需保留，因为后续还有执行机会。
+  Future<void> _reschedule(TaskConfig config) async {
+    _cancelTimers();
+    final nextTime = await _calculateNextTrigger(config);
+
+    if (nextTime == null) {
+      await LogService.write(
+        '[SchedulerService] Reschedule: no next trigger time found, '
+        'keeping task alive for retry (type=${config.taskType.name}, '
+        'mode=${config.scheduleMode.name})',
+      );
+      // 不删除任务：周期任务还有后续执行机会，保留配置等待下次重试
+      _nextTriggerTime = null;
+      _onStatusChanged?.call();
+      return;
+    }
+
+    _taskStartTime = DateTime.now();
+    _nextTriggerTime = nextTime;
+    _armTimers(config, nextTime);
+
+    await LogService.write('[SchedulerService] Rescheduled next run at $nextTime');
+    _onStatusChanged?.call();
+  }
+
+  /// 清空当前任务状态
+  void _clearTask() {
+    _cancelTimers();
     _currentConfig = null;
     _nextTriggerTime = null;
     _onStatusChanged?.call();
@@ -172,17 +334,44 @@ class SchedulerService {
 
   /// 取消任务
   Future<void> cancelTask() async {
-    _timer?.cancel();
-    _timer = null;
+    await LogService.write(
+      '[SchedulerService] Cancelling task (type=${_currentConfig?.taskType.name}, '
+      'next=$_nextTriggerTime)',
+    );
+    _cancelTimers();
     _currentConfig = null;
     _nextTriggerTime = null;
-    await WindowsService.cancelShutdown();
+    // 先刷新 UI，再做原生的兜底取消，避免原生调用抛异常时界面不更新
     _onStatusChanged?.call();
+
+    try {
+      await WindowsService.cancelShutdown();
+    } catch (e) {
+      // 没有待取消的系统关机时属正常情况，不应影响任务取消
+      await LogService.write('[SchedulerService] cancelShutdown ignored: $e');
+    }
   }
 
   /// 从配置恢复任务
   Future<void> restoreFromConfig(TaskConfig config) async {
     await startTask(config);
+  }
+
+  /// 设置变更（如提前提醒分钟数）后按当前执行时间重新装载定时器
+  ///
+  /// 与 `startTask` 的区别：不重新推算 `_nextTriggerTime`，也不重置
+  /// `_taskStartTime`，因此倒计时任务不会被"从现在开始"重新计时。
+  Future<void> refreshSettings() async {
+    final config = _currentConfig;
+    final nextTime = _nextTriggerTime;
+    if (config == null || nextTime == null) return;
+
+    _cancelTimers();
+    _armTimers(config, nextTime);
+    await LogService.write(
+      '[SchedulerService] Timers re-armed after settings change, next=$nextTime',
+    );
+    _onStatusChanged?.call();
   }
 
   /// 获取剩余时间字符串
@@ -291,34 +480,8 @@ class SchedulerService {
     }
   }
 
-  /// specificTime 模式下，从给定时间推算下一次执行时间
-  DateTime? _nextSpecificTime(DateTime from, TaskConfig config) {
-    final timeOfDay = config.targetTime != null
-        ? TimeOfDay(hour: config.targetTime!.hour, minute: config.targetTime!.minute)
-        : const TimeOfDay(hour: 23, minute: 55);
-
-    switch (config.frequency) {
-      case Frequency.daily:
-        return DateTime(from.year, from.month, from.day + 1, timeOfDay.hour, timeOfDay.minute);
-      case Frequency.weekly:
-        if (config.weekDays.isEmpty) return null;
-        var candidate = DateTime(from.year, from.month, from.day + 1, timeOfDay.hour, timeOfDay.minute);
-        while (!config.weekDays.contains(candidate.weekday)) {
-          candidate = candidate.add(const Duration(days: 1));
-        }
-        return candidate;
-      case Frequency.monthly:
-        final day = config.monthlyDay ?? 1;
-        var month = from.month + 1;
-        var year = from.year;
-        if (month > 12) { month = 1; year++; }
-        return DateTime(year, month, day, timeOfDay.hour, timeOfDay.minute);
-    }
-  }
-
   /// 释放资源
   void dispose() {
-    _timer?.cancel();
-    _timer = null;
+    _cancelTimers();
   }
 }

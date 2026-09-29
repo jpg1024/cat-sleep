@@ -9,9 +9,9 @@
 ## 功能特性
 
 ### 核心功能
-- **7 种任务类型**：关机、重启、注销、休眠、睡眠、锁定、关闭指定程序
+- **7 种任务类型**：关机、重启、注销、休眠、睡眠、锁定、提醒
 - **提醒任务**：支持多个定时提醒，时间到达时弹出强制对话框（即使应用最小化到托盘）
-- **3 种调度方式**：指定时间 / 从现在开始（倒计时）/ 每隔设置时间（循环）
+- **3 种调度方式**：从现在开始（倒计时）/ 工作日 / 指定时间
 - **频率控制**：每天 / 每周（可选星期几）/ 每月（可选日期）
 - **动态图标**：26 种动物图标可选
 
@@ -30,8 +30,8 @@
 - **强制通知**：应用最小化到托盘时也能弹出提醒对话框
 
 ### UI 设计
-- **极简主界面**：状态卡片 + 任务类型网格，所有设置收纳到弹窗
-- **Tab 标签页设置**：调度 / 工作日 / 提醒 / 空闲 / 系统 五个标签页
+- **极简主界面**：渐变状态卡片 + 操作按钮 + 后续执行时间线，所有配置收纳到弹窗
+- **两个独立弹窗**：新建任务（操作类型 / 调度方式 / 频率 / 节假日日历）、系统设置（提前提醒 / 开机自启 / 更换图标 / 重建工作日缓存 / 节假日管理）
 - **现代化视觉**：圆角 20px 卡片、渐变状态栏、微动效、大留白
 - **参考风格**：Raycast / Notion / Arc Browser
 
@@ -76,11 +76,15 @@
   - `intl` - 国际化
 
 ### 通知方案
-采用 **PowerShell Toast + Flutter Dialog 回退** 的混合方案：
-1. 首先尝试通过 PowerShell 调用 Windows Toast API
-2. 失败或超时时，使用 Flutter Dialog 作为回退
-3. Dialog 弹出前自动调用 `windowManager.show()` + `focus()` + `setAlwaysOnTop(true)` 确保窗口显示
-4. 即使应用最小化到托盘也能强制弹出对话框
+**先弹出主界面 → 再弹出 Flutter 强制 Dialog**，不使用 Windows Toast：
+1. `isMinimized()` → `restore()`，再 `show()` + `focus()` + `setAlwaysOnTop(true)` 把主窗口拉回前台
+2. 轮询 `isVisible()` 最多 500ms，确认主界面真的显示出来了
+3. 然后才 `showDialog(barrierDismissible: false)`，用户必须点「确定」才能关闭
+4. 关闭后恢复 `setAlwaysOnTop(false)`
+
+> 为什么不用 Toast：Windows Toast 要求开始菜单里存在带 `System.AppUserModel.ID` 的快捷方式，
+> 本项目只创建桌面/启动文件夹快捷方式，Toast 必然投递失败；早期实现还会把失败静默吞掉、
+> 误判为"发送成功"，导致提醒完全不弹。已于 2026-09-29 移除 Toast 及对应的 C++ 通道。
 
 ## 快速开始
 
@@ -103,9 +107,9 @@ flutter build windows --release # 发布编译
 
 ### 主界面
 - **状态卡片**：显示当前动物图标、倒计时、进度条
-- **操作按钮**：创建任务 / 取消任务 / 提醒任务
-- **任务类型网格**：7 种类型图标卡片，点击快速切换
-- **顶栏**：主题切换 + 设置入口
+- **操作按钮**：取消任务 / 提醒任务（新建任务入口在状态卡片上）
+- **后续执行时间线**：有周期任务时列出最近若干次执行时间，可展开查看全部
+- **顶栏**：主题切换 + 系统设置入口
 
 ### 提醒任务管理
 - **多任务并存**：可以创建多个提醒任务，每个任务独立计时
@@ -115,14 +119,11 @@ flutter build windows --release # 发布编译
 - **强制弹窗**：时间到达时自动弹出对话框，即使应用最小化到托盘也能看到
 - **一次性提醒**：触发后自动从列表中删除
 
-### 设置弹窗（Tab 标签页）
-| Tab | 内容 |
-|-----|------|
-| 调度 | 调度方式 + 日期时间 + 频率 + 星期/日期选择 |
-| 工作日 | 仅工作日开关 + 节假日日历（标注放假/调休/名称） |
-| 提醒 | 提前提醒 + 密码保护 |
-| 空闲 | 空闲检测 + 重复执行 |
-| 系统 | 开机自启 + 更换图标 |
+### 两个弹窗
+| 弹窗 | 内容 |
+|------|------|
+| 新建任务 `CreateTaskDialog` | 操作类型 + 调度方式（图标下拉）→ 联动时间配置：倒计时（时/分）、指定时间（日期时间 + 频率：每天/每周/每月）、工作日（时/分 + "仅在工作日前一晚执行"开关 + 节假日日历）；提醒类型额外显示"提醒内容"输入框 |
+| 系统设置 `SystemSettingsDialog` | 提前提醒（分钟）、开机自启、更换图标、重建工作日缓存、节假日管理（按年分组，添加/删除自定义日期，底部取消/保存） |
 
 ### 节假日日历
 - 绿色：放假（标注节日名称如"元旦"、"春节"）
@@ -140,27 +141,32 @@ flutter build windows --release # 发布编译
 
 ```
 lib/
-├── main.dart                      # 入口 + 托盘 + 主题
+├── main.dart                      # 入口 + 托盘 + 窗口生命周期（含 setPreventClose）
 ├── models/
-│   ├── task_config.dart           # 任务配置模型
+│   ├── task_config.dart           # 任务配置模型（含 fixedRemind 时间固定化工厂）
 │   └── workday_config.dart        # 工作日配置模型
 ├── theme/
 │   └── app_theme.dart             # 靛蓝主色调 + 白天/夜间主题
 ├── services/
-│   ├── windows_service.dart       # Windows 原生操作封装
+│   ├── windows_service.dart       # Windows 原生操作封装（Platform Channel）
+│   ├── scheduler_service.dart     # 定时调度引擎（周期任务自动重排期）
+│   ├── remind_task_service.dart   # 提醒任务多定时器管理（单例）
+│   ├── notification_service.dart  # 强制弹窗通知（先弹主界面再弹 Dialog）
 │   ├── storage_service.dart       # 本地持久化 + 节假日缓存
-│   ├── workday_service.dart       # 工作日判断（2026官方数据）
-│   ├── scheduler_service.dart     # 定时调度引擎
+│   ├── workday_service.dart       # 工作日判断（2026 官方数据）
+│   ├── year_workday_cache_service.dart # 全年工作日/eve 执行日预计算缓存
 │   ├── startup_service.dart       # 开机自启管理
-│   └── icon_service.dart          # 动态图标管理
+│   ├── icon_service.dart          # 动态图标管理（PNG→ICO）
+│   └── log_service.dart           # 文件日志
 ├── screens/
-│   └── home_screen.dart           # 极简主界面
+│   └── home_screen.dart           # 极简主界面 + 提醒任务管理弹窗
 └── widgets/
+    ├── create_task_dialog.dart    # 新建任务弹窗
+    ├── system_settings_dialog.dart # 系统设置弹窗 + 节假日管理
     ├── status_card.dart           # 渐变状态卡片
-    ├── task_type_grid.dart        # 任务类型图标网格
-    ├── settings_dialog.dart       # Tab 标签页设置弹窗
-    ├── segmented_control.dart     # 分段选择器
     ├── holiday_calendar.dart      # 节假日日历组件
+    ├── custom_date_editor.dart    # 自定义日期编辑
+    ├── segmented_control.dart     # 分段选择器
     └── icon_picker_dialog.dart    # 图标选择对话框
 
 assets/
@@ -168,10 +174,14 @@ assets/
 └── animals/                       # 26 种动物图标
 
 windows/runner/
-├── main.cpp                       # Platform Channel（含图标快捷方式）
-├── flutter_window.h               # 窗口控制
+├── main.cpp                       # Platform Channel handler + 快捷方式/图标
+├── flutter_window.cpp/.h          # Flutter 视图宿主
+├── win32_window.cpp/.h            # 窗口消息处理（quit_on_close 等）
 └── CMakeLists.txt                 # 构建配置
 ```
+
+> `lib/widgets/notification_overlay.dart` 是早期独立通知窗口方案的残留文件，无人 import
+> 且对 window_manager 0.4.3 存在编译错误，待删除。
 
 ## 2026 年放假安排（内置数据）
 
@@ -191,23 +201,31 @@ windows/runner/
 
 | 方法 | 说明 |
 |------|------|
-| `shutdown` | 关机 |
-| `restart` | 重启 |
-| `logoff` | 注销 |
-| `hibernate` | 休眠 |
-| `sleep` | 睡眠 |
-| `lock` | 锁定 |
-| `closeProgram` | 关闭程序（参数：`programName`） |
+| `shutdown` | 关机（`shutdown.exe /s /t 0`） |
+| `restart` | 重启（`shutdown.exe /r /t 0`） |
+| `logoff` | 注销（`shutdown.exe /l`） |
+| `hibernate` | 休眠（`shutdown.exe /h`，需系统已启用休眠） |
+| `sleep` | 睡眠（`rundll32.exe powrprof.dll,SetSuspendState 0,1,0`） |
+| `lock` | 锁定（`rundll32.exe user32.dll,LockWorkStation`） |
 | `createStartupShortcut` | 创建自启快捷方式 |
-| `createStartupShortcutWithIcon` | 创建带图标的自启快捷方式 |
+| `createStartupShortcutWithIcon` | 创建带图标的自启快捷方式（参数：`iconPath`） |
 | `removeStartupShortcut` | 删除自启快捷方式 |
 | `hasStartupShortcut` | 检查自启状态 |
-| `cancelShutdown` | 取消关机 |
+| `createDesktopShortcut` | 创建桌面快捷方式 |
+| `createDesktopShortcutWithIcon` | 创建带图标的桌面快捷方式（参数：`iconPath`） |
+| `removeDesktopShortcut` | 删除桌面快捷方式 |
+| `hasDesktopShortcut` | 检查桌面快捷方式是否存在 |
+| `setWindowIcon` | 设置窗口/任务栏图标（参数：`iconPath`，仅支持 ICO） |
+| `cancelShutdown` | 取消关机（`shutdown.exe /a`） |
+| `closeProgram` | 关闭指定程序（参数：`programName`）——**C++ 侧仍存在，但已无 Dart 调用方，属死代码** |
+
+> `showNotification` 通道已于 2026-09-29 移除，提醒统一走 Dart 侧的 `NotificationService`。
 
 ## 已知限制
 
-1. **密码保护**：UI 已预留开关，实际验证逻辑待实现
-2. **空闲检测**：UI 已实现，实际系统空闲时间检测待实现
+1. **休眠依赖系统设置**：`shutdown /h` 要求 Windows 已启用休眠（`powercfg /a` 可查看）；未启用时命令会失败，Dart 侧会收到 `CommandFailed` 错误并记录到日志
+2. **应用必须处于运行状态**：定时任务依赖进程内的 Dart Timer，应用退出（托盘菜单「退出」）后不会触发
+3. **睡眠命令的调用约定**：`rundll32.exe powrprof.dll,SetSuspendState 0,1,0` 的布尔参数实际不会按预期传入（rundll32 把逗号后的内容整体作为单个字符串传给第 3 个参数）；实际行为取决于系统状态（启用休眠则休眠，否则睡眠）。本机休眠未启用，所以结果是 S3 睡眠，但这是巧合正确
 
 ## 许可证
 

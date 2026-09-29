@@ -49,4 +49,57 @@ void main() {
           false);
     });
   });
+
+  group('TaskConfig.fixedRemind', () {
+    test('倒计时换算为绝对时间，且秒数归零', () {
+      final now = DateTime(2026, 9, 29, 10, 15, 42, 123);
+      final fixed = TaskConfig.fixedRemind(
+        TaskConfig(
+          taskType: TaskType.remind,
+          scheduleMode: ScheduleMode.countdown,
+          countdownHours: 1,
+          countdownMinutes: 30,
+          reminderText: '开会',
+        ),
+        now: now,
+      );
+
+      expect(fixed.scheduleMode, ScheduleMode.specificTime,
+          reason: '必须固定为绝对时间，否则每次重启都会顺延');
+      expect(fixed.targetTime, DateTime(2026, 9, 29, 11, 45, 0));
+      expect(fixed.reminderText, '开会');
+      expect(fixed.taskType, TaskType.remind);
+    });
+
+    test('指定时间模式同样把秒数归零', () {
+      final fixed = TaskConfig.fixedRemind(
+        TaskConfig(
+          taskType: TaskType.remind,
+          scheduleMode: ScheduleMode.specificTime,
+          targetTime: DateTime(2026, 10, 1, 8, 5, 37, 900),
+          reminderText: '国庆提醒',
+        ),
+        now: DateTime(2026, 9, 29, 10, 0, 0),
+      );
+
+      expect(fixed.targetTime, DateTime(2026, 10, 1, 8, 5, 0));
+      expect(fixed.reminderText, '国庆提醒');
+    });
+
+    test('targetTime 为空时不会崩溃，仍能产出可调度时间', () {
+      final fixed = TaskConfig.fixedRemind(
+        TaskConfig(
+          taskType: TaskType.remind,
+          scheduleMode: ScheduleMode.specificTime,
+          targetTime: null,
+          reminderText: '兜底',
+        ),
+        now: DateTime(2026, 9, 29, 10, 15, 42),
+      );
+
+      expect(fixed.targetTime, isNotNull,
+          reason: 'RemindTaskService 会丢弃 targetTime 为空的任务');
+      expect(fixed.targetTime, DateTime(2026, 9, 29, 10, 15, 0));
+    });
+  });
 }

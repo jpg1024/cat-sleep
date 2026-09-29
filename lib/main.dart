@@ -13,12 +13,15 @@ import 'services/windows_service.dart';
 import 'services/year_workday_cache_service.dart';
 import 'services/log_service.dart';
 import 'services/remind_task_service.dart';
-import 'services/notification_service.dart';
-import 'models/task_config.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await windowManager.ensureInitialized();
+
+  // 必须拦截 WM_CLOSE，否则点击关闭按钮会销毁窗口与 Flutter 引擎，
+  // 而 SetQuitOnClose(false) 又让进程存活 —— 结果是托盘图标还在、
+  // 但所有 Dart 定时器已随引擎一起消失，任务和提醒都不会再触发。
+  await windowManager.setPreventClose(true);
 
   // 初始化日志服务
   await LogService.init();
@@ -123,8 +126,11 @@ class CatSleepApp extends StatefulWidget {
 
 class _CatSleepAppState extends State<CatSleepApp> with TrayListener, WindowListener {
   final SchedulerService _scheduler = SchedulerService();
-  HomeScreenState? _homeScreen; // 保存 HomeScreen 引用以控制定时器
+  final GlobalKey<HomeScreenState> _homeScreenKey = GlobalKey<HomeScreenState>();
   bool _isDarkMode = false;
+
+  /// HomeScreen 的 State（未挂载时为 null）
+  HomeScreenState? get _homeScreen => _homeScreenKey.currentState;
 
   @override
   void initState() {
@@ -143,11 +149,6 @@ class _CatSleepAppState extends State<CatSleepApp> with TrayListener, WindowList
 
   /// 加载所有提醒任务并启动定时器
   Future<void> _loadRemindTasks() async {
-    await RemindTaskService().loadAndStartTasks();
-  }
-
-  /// 公开方法：供外部调用以重新加载提醒任务
-  Future<void> reloadRemindTasks() async {
     await RemindTaskService().loadAndStartTasks();
   }
 
@@ -185,18 +186,20 @@ class _CatSleepAppState extends State<CatSleepApp> with TrayListener, WindowList
   }
 
   @override
-  void onWindowClose() {
-    windowManager.hide();
-    // 窗口关闭时暂停倒计时定时器
+  void onWindowClose() async {
+    // setPreventClose(true) 已拦截 WM_CLOSE，这里只负责收进托盘，
+    // 引擎与所有定时器继续存活。
+    await LogService.write('[MainApp] Window close intercepted, hiding to tray');
+    await windowManager.hide();
     _homeScreen?.pauseCountdownTimer();
   }
-  
+
   @override
   void onWindowBlur() {
     // 窗口失去焦点（被其他窗口遮住）时暂停倒计时
     _homeScreen?.pauseCountdownTimer();
   }
-  
+
   @override
   void onWindowFocus() {
     // 窗口获得焦点时恢复倒计时
@@ -238,7 +241,8 @@ class _CatSleepAppState extends State<CatSleepApp> with TrayListener, WindowList
     await windowManager.focus();
     await windowManager.setAlwaysOnTop(true);
     await windowManager.setAlwaysOnTop(false);
-    // 窗口显示时恢复倒计时定时器（onWindowFocus 会自动触发）
+    // 不依赖 onWindowFocus 一定回调，这里显式恢复倒计时刷新
+    _homeScreen?.resumeCountdownTimer();
   }
 
   @override
@@ -256,21 +260,11 @@ class _CatSleepAppState extends State<CatSleepApp> with TrayListener, WindowList
       theme: AppTheme.lightTheme,
       darkTheme: AppTheme.darkTheme,
       themeMode: _isDarkMode ? ThemeMode.dark : ThemeMode.light,
-      home: Builder(
-        builder: (context) {
-          // 使用 Builder 获取 HomeScreen 的 State
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            final homeScreenState = context.findAncestorStateOfType<HomeScreenState>();
-            if (homeScreenState != null) {
-              _homeScreen = homeScreenState;
-            }
-          });
-          return HomeScreen(
-            scheduler: _scheduler,
-            onThemeToggle: _toggleTheme,
-            isDarkMode: _isDarkMode,
-          );
-        },
+      home: HomeScreen(
+        key: _homeScreenKey,
+        scheduler: _scheduler,
+        onThemeToggle: _toggleTheme,
+        isDarkMode: _isDarkMode,
       ),
     );
   }

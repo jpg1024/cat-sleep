@@ -83,9 +83,19 @@ class HomeScreenState extends State<HomeScreen> {
       if (mounted) setState(() => _nextExecutions = []);
       return;
     }
-    final list = await widget.scheduler.getNextExecutions(_config);
-    if (mounted) {
-      setState(() => _nextExecutions = list);
+    try {
+      final list = await widget.scheduler.getNextExecutions(_config);
+      await LogService.write(
+        '[HomeScreen] Loaded ${list.length} next executions '
+        '(mode=${_config.scheduleMode.name}, hasTask=${widget.scheduler.hasActiveTask})',
+      );
+      if (mounted) {
+        setState(() => _nextExecutions = list);
+      }
+    } catch (e, stackTrace) {
+      await LogService.write(
+        '[HomeScreen] Failed to load next executions: $e\n$stackTrace',
+      );
     }
   }
 
@@ -96,36 +106,35 @@ class HomeScreenState extends State<HomeScreen> {
 
     final savedConfig = await StorageService.loadTaskConfig();
     if (savedConfig != null) {
+      await LogService.write(
+        '[HomeScreen] Restoring task: type=${savedConfig.taskType.name}, '
+        'mode=${savedConfig.scheduleMode.name}, targetTime=${savedConfig.targetTime}',
+      );
       _config = savedConfig;
       await widget.scheduler.restoreFromConfig(_config);
       await _loadNextExecutions();
+    } else {
+      await LogService.write('[HomeScreen] No saved task config, scheduler idle');
     }
 
     setState(() => _loading = false);
   }
 
   Future<void> _openCreateTask() async {
-    // 每次打开新建任务弹窗前，将调度方式重置为"从现在开始"
-    setState(() {
-      _config.scheduleMode = ScheduleMode.countdown;
-    });
-
+    // 弹窗默认从"从现在开始"起步。注意不能直接改 _config：
+    // 它与 SchedulerService._currentConfig 是同一个对象，改动会让
+    // 正在运行的任务被静默切换调度方式，退出时还会被持久化。
     final tempConfig = TaskConfig(
       taskType: _config.taskType,
-      scheduleMode: _config.scheduleMode,
+      scheduleMode: ScheduleMode.countdown,
       targetTime: _config.targetTime,
       countdownHours: _config.countdownHours,
       countdownMinutes: _config.countdownMinutes,
       frequency: _config.frequency,
       weekDays: List.from(_config.weekDays),
       monthlyDay: _config.monthlyDay,
-      idleEnabled: _config.idleEnabled,
-      idleHours: _config.idleHours,
-      idleMinutes: _config.idleMinutes,
-      idleRepeat: _config.idleRepeat,
       reminderEnabled: _config.reminderEnabled,
       reminderMinutes: _config.reminderMinutes,
-      passwordProtected: _config.passwordProtected,
       workdayOnly: _config.workdayOnly,
       workdayEveOnly: _config.workdayEveOnly,
       reminderText: _config.reminderText,
@@ -137,8 +146,12 @@ class HomeScreenState extends State<HomeScreen> {
     );
 
     if (result != null) {
-      // 如果是提醒类型，弹出二次确认
+      // 提醒类型：写入提醒任务列表后立即返回，不覆盖当前的系统操作任务
       if (result.taskType == TaskType.remind) {
+        // 倒计时必须换算成绝对时间，否则重启后会顺延，
+        // 且 targetTime 为空的任务会被 RemindTaskService 直接丢弃。
+        final fixedTask = TaskConfig.fixedRemind(result);
+
         final confirmed = await showDialog<bool>(
           context: context,
           builder: (_) => AlertDialog(
@@ -147,7 +160,7 @@ class HomeScreenState extends State<HomeScreen> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('将在 ${_formatTriggerTime(result)} 提醒您：'),
+                Text('将在 ${_formatTriggerTime(fixedTask)} 提醒您：'),
                 const SizedBox(height: 12),
                 Container(
                   padding: const EdgeInsets.all(12),
@@ -156,7 +169,7 @@ class HomeScreenState extends State<HomeScreen> {
                     borderRadius: BorderRadius.circular(8),
                   ),
                   child: Text(
-                    result.reminderText ?? '未设置提醒内容',
+                    fixedTask.reminderText ?? '未设置提醒内容',
                     style: const TextStyle(fontSize: 13),
                   ),
                 ),
@@ -175,11 +188,27 @@ class HomeScreenState extends State<HomeScreen> {
           ),
         );
         if (confirmed != true) return;
-        
-        // 保存提醒任务到独立文件
-        await StorageService.addRemindTask(result);
+
+        await LogService.write(
+          '[HomeScreen] Creating remind task: text="${fixedTask.reminderText}", '
+          'targetTime=${fixedTask.targetTime}',
+        );
+        await StorageService.addRemindTask(fixedTask);
+        // 必须重新加载，否则新提醒要等到下次启动应用才会被调度
+        await RemindTaskService().loadAndStartTasks();
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('提醒任务已设置'),
+              behavior: SnackBarBehavior.floating,
+              duration: Duration(seconds: 2),
+            ),
+          );
+        }
+        return;
       }
-      
+
       _config = result;
       await StorageService.saveTaskConfig(_config);
       await widget.scheduler.startTask(_config);
@@ -187,10 +216,10 @@ class HomeScreenState extends State<HomeScreen> {
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(result.taskType == TaskType.remind ? '提醒任务已设置' : '任务已设置'),
+          const SnackBar(
+            content: Text('任务已设置'),
             behavior: SnackBarBehavior.floating,
-            duration: const Duration(seconds: 2),
+            duration: Duration(seconds: 2),
           ),
         );
       }
@@ -211,79 +240,6 @@ class HomeScreenState extends State<HomeScreen> {
     return '未知时间';
   }
 
-  /// 打开新建提醒任务弹窗（独立入口，不影响当前活跃任务）
-  Future<void> _openCreateRemindTask() async {
-    // 创建默认的提醒任务配置
-    final remindConfig = TaskConfig(
-      taskType: TaskType.remind,
-      scheduleMode: ScheduleMode.countdown,
-      countdownHours: 0,
-      countdownMinutes: 30,
-      reminderText: '',
-    );
-
-    final result = await showDialog<TaskConfig>(
-      context: context,
-      builder: (context) => CreateTaskDialog(
-        config: remindConfig,
-        lockTaskType: true,  // 锁定操作类型为提醒
-      ),
-    );
-
-    if (result != null && result.taskType == TaskType.remind) {
-      // 弹出二次确认
-      final confirmed = await showDialog<bool>(
-        context: context,
-        builder: (_) => AlertDialog(
-          title: const Text('确认创建提醒任务'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('将在 ${_formatTriggerTime(result)} 提醒您：'),
-              const SizedBox(height: 12),
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.primary.withOpacity(0.08),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Text(
-                  result.reminderText ?? '未设置提醒内容',
-                  style: const TextStyle(fontSize: 13),
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('确认'),
-            ),
-          ],
-        ),
-      );
-      if (confirmed != true) return;
-
-      // 保存提醒任务到独立文件（不影响当前活跃任务）
-      await StorageService.addRemindTask(result);
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('提醒任务已设置'),
-            behavior: SnackBarBehavior.floating,
-            duration: Duration(seconds: 2),
-          ),
-        );
-      }
-    }
-  }
-
   /// 打开提醒任务管理弹窗
   Future<void> _openRemindTaskManager() async {
     await showDialog(
@@ -297,9 +253,15 @@ class HomeScreenState extends State<HomeScreen> {
       context: context,
       builder: (context) => SystemSettingsDialog(config: _config),
     );
-    // 保存可能的提醒配置变更
-    await StorageService.saveTaskConfig(_config);
-    
+
+    // 仅在有活跃任务时写盘：无任务时写入 task_config.json，会让下次启动
+    // 把一个用户从未设置的"幽灵任务"自动排期执行。
+    if (widget.scheduler.hasActiveTask) {
+      await StorageService.saveTaskConfig(_config);
+      // 提前提醒分钟数等设置变更后，按原执行时间重新装载定时器
+      await widget.scheduler.refreshSettings();
+    }
+
     // 重新读取图标配置（用户可能更换了图标）
     final newIcon = await IconService.getCurrentIcon();
     if (mounted && newIcon != _currentIcon) {
@@ -750,32 +712,7 @@ class _RemindTaskManagerDialogState extends State<_RemindTaskManagerDialog> {
 
     if (result != null && result.taskType == TaskType.remind) {
       // 将倒计时模式转换为固定时间模式（保存绝对时间，秒数归零）
-      DateTime targetTime;
-      if (result.scheduleMode == ScheduleMode.countdown) {
-        final rawTime = DateTime.now().add(Duration(
-          hours: result.countdownHours,
-          minutes: result.countdownMinutes,
-        ));
-        // 秒数归零
-        targetTime = DateTime(rawTime.year, rawTime.month, rawTime.day, rawTime.hour, rawTime.minute, 0);
-      } else {
-        // 指定时间模式：秒数也归零
-        targetTime = DateTime(
-          result.targetTime!.year,
-          result.targetTime!.month,
-          result.targetTime!.day,
-          result.targetTime!.hour,
-          result.targetTime!.minute,
-          0,
-        );
-      }
-
-      final fixedTask = TaskConfig(
-        taskType: result.taskType,
-        scheduleMode: ScheduleMode.specificTime,  // 改为指定时间模式
-        targetTime: targetTime,
-        reminderText: result.reminderText,
-      );
+      final fixedTask = TaskConfig.fixedRemind(result);
 
       await LogService.write('[RemindTaskManager] Creating new task: text="${fixedTask.reminderText}", targetTime=${fixedTask.targetTime}');
 
@@ -1045,10 +982,5 @@ class _RemindTaskManagerDialogState extends State<_RemindTaskManagerDialog> {
         ),
       ),
     );
-  }
-
-  void _openRemindTaskManager() {
-    Navigator.pop(context);
-    // 这里需要通过某种方式重新打开，暂时简化
   }
 }

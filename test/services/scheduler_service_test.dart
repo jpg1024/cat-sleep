@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 const _pathProviderChannel = MethodChannel('plugins.flutter.io/path_provider');
+const _windowsChannel = MethodChannel('cat_sleep/windows');
 
 /// 预置 2026 全年节假日缓存（含周末），使 isWorkday 完全离线且结果确定
 Map<String, dynamic> _build2026Cache() {
@@ -105,5 +106,263 @@ void main() {
           reason: '普通工作日模式执行日 $d 必须是工作日');
     }
     scheduler.dispose();
+  });
+
+  group('任务执行', () {
+    late List<String> invokedMethods;
+
+    setUp(() {
+      invokedMethods = <String>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(_windowsChannel, (call) async {
+        invokedMethods.add(call.method);
+        return null;
+      });
+    });
+
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(_windowsChannel, null);
+    });
+
+    test('周期任务（工作日模式）执行后重新排期，不会消失', () async {
+      final scheduler = SchedulerService();
+      await scheduler.startTask(TaskConfig(
+        taskType: TaskType.shutdown,
+        scheduleMode: ScheduleMode.workday,
+        targetTime: DateTime(2026, 1, 1, 23, 55),
+        workdayEveOnly: false,
+      ));
+
+      expect(scheduler.hasActiveTask, isTrue, reason: '启动后应处于活跃状态');
+      final firstTrigger = scheduler.nextTriggerTime;
+      expect(firstTrigger, isNotNull);
+
+      await scheduler.debugExecuteTask();
+
+      expect(invokedMethods, contains('shutdown'), reason: '应调用关机操作');
+      expect(scheduler.hasActiveTask, isTrue,
+          reason: '工作日模式是周期任务，执行一次后必须继续排下一次，不能清空');
+      expect(scheduler.currentConfig, isNotNull);
+      expect(scheduler.nextTriggerTime, isNotNull);
+      expect(scheduler.nextTriggerTime, firstTrigger);
+      scheduler.dispose();
+    });
+
+    test('周期任务（指定时间 + 每天）执行后重新排期', () async {
+      final scheduler = SchedulerService();
+      final now = DateTime.now();
+      await scheduler.startTask(TaskConfig(
+        taskType: TaskType.lock,
+        scheduleMode: ScheduleMode.specificTime,
+        targetTime: DateTime(now.year, now.month, now.day, 23, 55),
+        frequency: Frequency.daily,
+      ));
+
+      expect(scheduler.hasActiveTask, isTrue);
+
+      await scheduler.debugExecuteTask();
+
+      expect(invokedMethods, contains('lock'));
+      expect(scheduler.hasActiveTask, isTrue,
+          reason: '指定时间 + 每天是周期任务，执行后应继续保留');
+      scheduler.dispose();
+    });
+
+    test('一次性倒计时任务执行后清空状态', () async {
+      final scheduler = SchedulerService();
+      await scheduler.startTask(TaskConfig(
+        taskType: TaskType.lock,
+        scheduleMode: ScheduleMode.countdown,
+        countdownHours: 1,
+        countdownMinutes: 0,
+      ));
+
+      expect(scheduler.hasActiveTask, isTrue);
+
+      await scheduler.debugExecuteTask();
+
+      expect(invokedMethods, contains('lock'));
+      expect(scheduler.hasActiveTask, isFalse,
+          reason: '倒计时是一次性任务，执行后应清空');
+      expect(scheduler.currentConfig, isNull);
+      expect(scheduler.nextTriggerTime, isNull);
+      scheduler.dispose();
+    });
+
+    test('系统操作抛异常时不会中断调度', () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(_windowsChannel, (call) async {
+        throw PlatformException(code: 'boom', message: '原生调用失败');
+      });
+
+      final scheduler = SchedulerService();
+      await scheduler.startTask(TaskConfig(
+        taskType: TaskType.shutdown,
+        scheduleMode: ScheduleMode.workday,
+        targetTime: DateTime(2026, 1, 1, 23, 55),
+      ));
+
+      await scheduler.debugExecuteTask();
+
+      expect(scheduler.hasActiveTask, isTrue,
+          reason: '单次原生调用失败不应让周期任务彻底消失');
+      scheduler.dispose();
+    });
+
+    test('每周频率与所选星期矛盾时不会死循环，任务安全失效', () async {
+      final scheduler = SchedulerService();
+      final now = DateTime.now();
+      // targetTime 落在周三，但 weekDays 只勾了周一，且开启仅工作日过滤
+      final wednesday = now.subtract(Duration(days: now.weekday - 3));
+      await scheduler
+          .startTask(TaskConfig(
+        taskType: TaskType.lock,
+        scheduleMode: ScheduleMode.specificTime,
+        targetTime: DateTime(wednesday.year, wednesday.month, wednesday.day, 22, 0),
+        frequency: Frequency.weekly,
+        weekDays: [1],
+        workdayOnly: true,
+      ))
+          .timeout(const Duration(seconds: 20), onTimeout: () {
+        fail('startTask 在矛盾配置下卡住（死循环）');
+      });
+
+      expect(scheduler.hasActiveTask, isFalse,
+          reason: '找不到合法执行时间时应放弃排期，而不是永久挂起');
+      expect(scheduler.currentConfig, isNull);
+      scheduler.dispose();
+    });
+  });
+
+  group('提前提醒', () {
+    setUp(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(_windowsChannel, (call) async => null);
+    });
+
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(_windowsChannel, null);
+    });
+
+    /// 默认 2 小时后执行的一次性任务
+    TaskConfig countdownTask({
+      required bool reminderEnabled,
+      required int reminderMinutes,
+      TaskType taskType = TaskType.shutdown,
+      int countdownMinutes = 120,
+    }) =>
+        TaskConfig(
+          taskType: taskType,
+          scheduleMode: ScheduleMode.countdown,
+          countdownHours: 0,
+          countdownMinutes: countdownMinutes,
+          reminderEnabled: reminderEnabled,
+          reminderMinutes: reminderMinutes,
+        );
+
+    test('开启提前提醒且提前量足够时，会装载提醒定时器', () async {
+      final scheduler = SchedulerService();
+      await scheduler.startTask(countdownTask(reminderEnabled: true, reminderMinutes: 10));
+
+      expect(scheduler.hasActiveTask, isTrue);
+      expect(scheduler.hasPendingPreReminder, isTrue,
+          reason: '2 小时后执行、提前 10 分钟提醒，应当装上提醒定时器');
+      scheduler.dispose();
+    });
+
+    test('关闭提前提醒时不装载', () async {
+      final scheduler = SchedulerService();
+      await scheduler.startTask(countdownTask(reminderEnabled: false, reminderMinutes: 10));
+
+      expect(scheduler.hasActiveTask, isTrue);
+      expect(scheduler.hasPendingPreReminder, isFalse);
+      scheduler.dispose();
+    });
+
+    test('提前量为 0 时不装载', () async {
+      final scheduler = SchedulerService();
+      await scheduler.startTask(countdownTask(reminderEnabled: true, reminderMinutes: 0));
+
+      expect(scheduler.hasActiveTask, isTrue);
+      expect(scheduler.hasPendingPreReminder, isFalse);
+      scheduler.dispose();
+    });
+
+    test('距执行时间不足提前量时跳过，避免立刻弹窗', () async {
+      final scheduler = SchedulerService();
+      await scheduler.startTask(countdownTask(
+        reminderEnabled: true,
+        reminderMinutes: 10,
+        countdownMinutes: 5, // 只剩 5 分钟，却要提前 10 分钟提醒
+      ));
+
+      expect(scheduler.hasActiveTask, isTrue);
+      expect(scheduler.hasPendingPreReminder, isFalse,
+          reason: '提前量大于剩余时间时应跳过，而不是立即弹出');
+      scheduler.dispose();
+    });
+
+    test('提醒类型任务不叠加提前提醒', () async {
+      final scheduler = SchedulerService();
+      await scheduler.startTask(countdownTask(
+        reminderEnabled: true,
+        reminderMinutes: 10,
+        taskType: TaskType.remind,
+      ));
+
+      expect(scheduler.hasActiveTask, isTrue);
+      expect(scheduler.hasPendingPreReminder, isFalse,
+          reason: '提醒任务本身就是提醒，不应再叠加一层提前提醒');
+      scheduler.dispose();
+    });
+
+    test('取消任务时一并清掉提前提醒', () async {
+      final scheduler = SchedulerService();
+      await scheduler.startTask(countdownTask(reminderEnabled: true, reminderMinutes: 10));
+      expect(scheduler.hasPendingPreReminder, isTrue);
+
+      await scheduler.cancelTask();
+
+      expect(scheduler.hasPendingPreReminder, isFalse);
+      expect(scheduler.hasActiveTask, isFalse);
+      scheduler.dispose();
+    });
+
+    test('一次性任务执行后清掉提前提醒', () async {
+      final scheduler = SchedulerService();
+      await scheduler.startTask(countdownTask(reminderEnabled: true, reminderMinutes: 10));
+      expect(scheduler.hasPendingPreReminder, isTrue);
+
+      await scheduler.debugExecuteTask();
+
+      expect(scheduler.hasPendingPreReminder, isFalse);
+      expect(scheduler.hasActiveTask, isFalse);
+      scheduler.dispose();
+    });
+
+    test('周期任务执行后重新装载提前提醒', () async {
+      final scheduler = SchedulerService();
+      final now = DateTime.now();
+      final target = now.add(const Duration(hours: 2));
+      await scheduler.startTask(TaskConfig(
+        taskType: TaskType.lock,
+        scheduleMode: ScheduleMode.specificTime,
+        targetTime: DateTime(target.year, target.month, target.day, target.hour, target.minute),
+        frequency: Frequency.daily,
+        reminderEnabled: true,
+        reminderMinutes: 10,
+      ));
+
+      expect(scheduler.hasPendingPreReminder, isTrue);
+
+      await scheduler.debugExecuteTask();
+
+      expect(scheduler.hasActiveTask, isTrue, reason: '周期任务执行后应重排');
+      expect(scheduler.hasPendingPreReminder, isTrue,
+          reason: '重排后必须重新装载下一次执行的提前提醒');
+      scheduler.dispose();
+    });
   });
 }

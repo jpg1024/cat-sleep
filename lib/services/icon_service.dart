@@ -1,9 +1,7 @@
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:path_provider/path_provider.dart';
-import 'package:tray_manager/tray_manager.dart';
 import 'storage_service.dart';
-import 'windows_service.dart';
 
 /// 图标管理服务
 class IconService {
@@ -58,37 +56,6 @@ class IconService {
   static int _readUint32(Uint8List data, int offset) {
     return (data[offset] << 24) | (data[offset + 1] << 16) |
            (data[offset + 2] << 8) | data[offset + 3];
-  }
-
-  /// 将 PNG 文件转换为 ICO 文件
-  static Future<String> _ensureIcoFile(String pngPath) async {
-    final icoPath = await getIcoPath();
-    try {
-      final pngFile = File(pngPath);
-      if (!await pngFile.exists()) return icoPath;
-
-      final pngData = await pngFile.readAsBytes();
-      final icoData = wrapPngAsIco(Uint8List.fromList(pngData));
-      await File(icoPath).writeAsBytes(icoData);
-    } catch (_) {}
-    return icoPath;
-  }
-
-  /// 获取图标文件的绝对路径（PNG）
-  static Future<String> _getAbsoluteIconPath(String relativePath) async {
-    try {
-      final exeDir = File(Platform.resolvedExecutable).parent.path;
-      final absPath = '$exeDir\\data\\flutter_assets\\$relativePath';
-      if (await File(absPath).exists()) return absPath;
-    } catch (_) {}
-
-    try {
-      if (await File(relativePath).exists()) {
-        return File(relativePath).absolute.path;
-      }
-    } catch (_) {}
-
-    return relativePath;
   }
 
   /// 应用图标（仅保存配置，供主界面显示使用）

@@ -11,19 +11,73 @@
 #include "flutter_window.h"
 #include "utils.h"
 
-// Helper: execute a command
-static bool ExecuteCommand(const std::wstring& cmd) {
+// Default wait for commands that return immediately (shutdown.exe,
+// rundll32 LockWorkStation). Kept short because the handler runs on the
+// platform thread and blocks the Windows message pump while waiting.
+static const DWORD kCommandTimeoutMs = 5000;
+
+// Helper: execute a command through cmd.exe without a console window.
+//
+// timeoutMs == 0 means "fire and forget": the process is launched and both
+// handles are closed without waiting. This is required for commands that
+// legitimately do not return until the system resumes (rundll32
+// SetSuspendState). Waiting on those would block the platform thread for the
+// whole suspend period, and because WaitForSingleObject timeouts are counted
+// in interrupt time (which does not advance during S3/S4), the remaining
+// timeout would keep the message pump frozen *after* wake as well.
+//
+// When waiting, *exitCode receives the child process exit code and the
+// function returns true. Returns false if the process could not be started,
+// the wait timed out, or the exit code could not be read.
+static bool ExecuteCommand(const std::wstring& cmd, DWORD timeoutMs,
+                           DWORD* exitCode) {
   STARTUPINFOW si = {sizeof(si)};
   PROCESS_INFORMATION pi = {};
   std::wstring fullCmd = L"cmd.exe /c " + cmd;
-  if (CreateProcessW(nullptr, &fullCmd[0], nullptr, nullptr, FALSE,
-                     CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-    WaitForSingleObject(pi.hProcess, 30000);
+  if (!CreateProcessW(nullptr, &fullCmd[0], nullptr, nullptr, FALSE,
+                      CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+    return false;
+  }
+
+  if (timeoutMs == 0) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     return true;
   }
-  return false;
+
+  bool ok = false;
+  if (WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_OBJECT_0) {
+    DWORD code = 0;
+    if (GetExitCodeProcess(pi.hProcess, &code)) {
+      if (exitCode != nullptr) {
+        *exitCode = code;
+      }
+      ok = true;
+    }
+  }
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+  return ok;
+}
+
+// Helper: run a system command and report the real outcome back to Dart.
+// Previously every handler returned Success() unconditionally, so a failed
+// command (for example "shutdown /h" on a machine without hibernation
+// enabled) was silently reported as executed.
+static void RunSystemCommand(
+    const std::wstring& cmd, DWORD timeoutMs,
+    flutter::MethodResult<flutter::EncodableValue>* result) {
+  DWORD exitCode = 0;
+  if (!ExecuteCommand(cmd, timeoutMs, &exitCode)) {
+    result->Error("CommandFailed", timeoutMs == 0
+                                       ? "Could not launch command"
+                                       : "Command did not finish in time");
+  } else if (timeoutMs != 0 && exitCode != 0) {
+    result->Error("CommandFailed",
+                  "Command exit code " + std::to_string(exitCode));
+  } else {
+    result->Success();
+  }
 }
 
 // Helper: get startup folder path
@@ -232,34 +286,21 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
           const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
 
           if (method == "shutdown") {
-            ExecuteCommand(L"shutdown.exe /s /t 0");
-            result->Success();
+            RunSystemCommand(L"shutdown.exe /s /t 0", kCommandTimeoutMs, result.get());
           } else if (method == "restart") {
-            ExecuteCommand(L"shutdown.exe /r /t 0");
-            result->Success();
+            RunSystemCommand(L"shutdown.exe /r /t 0", kCommandTimeoutMs, result.get());
           } else if (method == "logoff") {
-            ExecuteCommand(L"shutdown.exe /l");
-            result->Success();
+            RunSystemCommand(L"shutdown.exe /l", kCommandTimeoutMs, result.get());
           } else if (method == "hibernate") {
-            ExecuteCommand(L"shutdown.exe /h");
-            result->Success();
+            RunSystemCommand(L"shutdown.exe /h", kCommandTimeoutMs, result.get());
           } else if (method == "sleep") {
-            ExecuteCommand(L"rundll32.exe powrprof.dll,SetSuspendState 0,1,0");
-            result->Success();
+            // SetSuspendState does not return until the system resumes, so
+            // this one is launched without waiting (timeoutMs == 0).
+            RunSystemCommand(L"rundll32.exe powrprof.dll,SetSuspendState 0,1,0", 0,
+                             result.get());
           } else if (method == "lock") {
-            ExecuteCommand(L"rundll32.exe user32.dll,LockWorkStation");
-            result->Success();
-          } else if (method == "closeProgram") {
-            if (args) {
-              auto it = args->find(flutter::EncodableValue("programName"));
-              if (it != args->end()) {
-                std::string progName = std::get<std::string>(it->second);
-                std::wstring wProgName(progName.begin(), progName.end());
-                std::wstring cmd = L"taskkill /IM " + wProgName + L" /F";
-                ExecuteCommand(cmd);
-              }
-            }
-            result->Success();
+            RunSystemCommand(L"rundll32.exe user32.dll,LockWorkStation",
+                             kCommandTimeoutMs, result.get());
           } else if (method == "createStartupShortcut") {
             bool ok = CreateStartupShortcut();
             result->Success(flutter::EncodableValue(ok));
@@ -340,50 +381,20 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
             } else {
               result->Success(flutter::EncodableValue(false));
             }
-          } else if (method == "showNotification") {
-            if (args) {
-              auto title_it = args->find(flutter::EncodableValue("title"));
-              auto body_it = args->find(flutter::EncodableValue("body"));
-              if (title_it != args->end() && body_it != args->end()) {
-                std::string titleStr = std::get<std::string>(title_it->second);
-                std::string bodyStr = std::get<std::string>(body_it->second);
-                
-                // Convert UTF-8 to wide string
-                int titleLen = MultiByteToWideChar(CP_UTF8, 0, titleStr.c_str(), -1, nullptr, 0);
-                std::wstring titleW(titleLen, 0);
-                MultiByteToWideChar(CP_UTF8, 0, titleStr.c_str(), -1, &titleW[0], titleLen);
-                
-                int bodyLen = MultiByteToWideChar(CP_UTF8, 0, bodyStr.c_str(), -1, nullptr, 0);
-                std::wstring bodyW(bodyLen, 0);
-                MultiByteToWideChar(CP_UTF8, 0, bodyStr.c_str(), -1, &bodyW[0], bodyLen);
-                
-                // Use simpler PowerShell command with error handling
-                std::wstring psCmd = L"powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command \""
-                    L"$ErrorActionPreference = 'Stop'; "
-                    L"try { "
-                    L"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
-                    L"$template = [Windows.UI.Notifications.ToastTemplateType]::toastText02; "
-                    L"$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($template).GetXml(); "
-                    L"$xml.GetElementsByTagName('text')[0].AppendChild($xml.CreateTextNode('" + titleW + L"')); "
-                    L"$xml.GetElementsByTagName('text')[1].AppendChild($xml.CreateTextNode('" + bodyW + L"')); "
-                    L"$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('CatSleep'); "
-                    L"$notifier.Show([Windows.UI.Notifications.ToastNotification]::CreateFromXml($xml)); "
-                    L"} catch { "
-                    L"Add-Type -AssemblyName System.Windows.Forms; "
-                    L"[System.Windows.Forms.MessageBox]::Show('" + bodyW + L"', '" + titleW + L"'); "
-                    L"}\"";
-                
-                ExecuteCommand(psCmd);
-                result->Success();
-              } else {
-                result->Error("InvalidArguments", "Missing title or body");
-              }
-            } else {
-              result->Error("InvalidArguments", "Arguments are null");
-            }
           } else if (method == "cancelShutdown") {
-            ExecuteCommand(L"shutdown.exe /a");
-            result->Success();
+            // "shutdown /a" exits with 1116 when no shutdown is in progress.
+            // That is already the desired end state, so treat it as success and
+            // keep cancel idempotent.
+            DWORD cancelExitCode = 0;
+            if (!ExecuteCommand(L"shutdown.exe /a", kCommandTimeoutMs,
+                                &cancelExitCode)) {
+              result->Error("CommandFailed", "Command did not finish in time");
+            } else if (cancelExitCode != 0 && cancelExitCode != 1116) {
+              result->Error("CommandFailed",
+                            "Command exit code " + std::to_string(cancelExitCode));
+            } else {
+              result->Success();
+            }
           } else {
             result->NotImplemented();
           }

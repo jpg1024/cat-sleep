@@ -24,7 +24,6 @@ class _CustomDateEditorState extends State<CustomDateEditor> {
   late String _type;
   String _name = '';
   final _nameController = TextEditingController();
-  bool _isRange = false;
 
   @override
   void initState() {
