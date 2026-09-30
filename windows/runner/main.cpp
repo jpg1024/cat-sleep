@@ -60,6 +60,21 @@ static bool ExecuteCommand(const std::wstring& cmd, DWORD timeoutMs,
   return ok;
 }
 
+// Native shutdown/restart via Windows API -- avoids spawning shutdown.exe
+// through cmd.exe, which produced spurious non-zero exit codes (e.g. 1271)
+// on some systems. InitiateSystemShutdownExW is available to standard users
+// (they hold SeShutdownPrivilege by default) and returns immediately when
+// the timeout is 0.
+static bool NativeShutdown() {
+  return InitiateSystemShutdownExW(nullptr, nullptr, 0, TRUE, FALSE,
+                                   SHTDN_REASON_FLAG_PLANNED) != 0;
+}
+
+static bool NativeRestart() {
+  return InitiateSystemShutdownExW(nullptr, nullptr, 0, TRUE, TRUE,
+                                   SHTDN_REASON_FLAG_PLANNED) != 0;
+}
+
 // Helper: run a system command and report the real outcome back to Dart.
 // Previously every handler returned Success() unconditionally, so a failed
 // command (for example "shutdown /h" on a machine without hibernation
@@ -286,9 +301,21 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
           const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
 
           if (method == "shutdown") {
-            RunSystemCommand(L"shutdown.exe /s /t 0", kCommandTimeoutMs, result.get());
+            if (NativeShutdown()) {
+              result->Success();
+            } else {
+              result->Error("CommandFailed",
+                            "InitiateSystemShutdownEx failed: " +
+                                std::to_string(GetLastError()));
+            }
           } else if (method == "restart") {
-            RunSystemCommand(L"shutdown.exe /r /t 0", kCommandTimeoutMs, result.get());
+            if (NativeRestart()) {
+              result->Success();
+            } else {
+              result->Error("CommandFailed",
+                            "InitiateSystemShutdownEx(restart) failed: " +
+                                std::to_string(GetLastError()));
+            }
           } else if (method == "logoff") {
             RunSystemCommand(L"shutdown.exe /l", kCommandTimeoutMs, result.get());
           } else if (method == "hibernate") {

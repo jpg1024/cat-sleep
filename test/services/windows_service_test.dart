@@ -8,9 +8,8 @@ import 'package:flutter_test/flutter_test.dart';
 const _windowsChannel = MethodChannel('cat_sleep/windows');
 
 /// 6 种系统操作在 C++ 侧应执行的命令（提醒除外，它不走原生通道）
+/// 关机和重启已改用 Windows API（InitiateSystemShutdownExW），不再走 shutdown.exe
 const _expectedNativeCommands = <TaskType, String>{
-  TaskType.shutdown: 'shutdown.exe /s /t 0',
-  TaskType.restart: 'shutdown.exe /r /t 0',
   TaskType.logoff: 'shutdown.exe /l',
   TaskType.hibernate: 'shutdown.exe /h',
   TaskType.sleep: 'rundll32.exe powrprof.dll,SetSuspendState',
@@ -45,6 +44,18 @@ void main() {
         expect(calls.single.method, entry.key.method);
       });
     }
+
+    test('关机（shutdown）调用原生 shutdown', () async {
+      await WindowsService.executeTask(TaskType.shutdown.method);
+      expect(calls, hasLength(1));
+      expect(calls.single.method, 'shutdown');
+    });
+
+    test('重启（restart）调用原生 restart', () async {
+      await WindowsService.executeTask(TaskType.restart.method);
+      expect(calls, hasLength(1));
+      expect(calls.single.method, 'restart');
+    });
 
     test('提醒类型不触发任何原生调用', () async {
       await WindowsService.executeTask(TaskType.remind.method);
@@ -97,6 +108,18 @@ void main() {
             reason: '${entry.key.label} 的原生命令应为 ${entry.value}');
       });
     }
+
+    test('关机 在 main.cpp 中使用 InitiateSystemShutdownExW（不再依赖 shutdown.exe）', () {
+      expect(mainCpp, contains('method == "shutdown"'));
+      expect(mainCpp, contains('NativeShutdown()'));
+      expect(mainCpp, contains('InitiateSystemShutdownExW'));
+    });
+
+    test('重启 在 main.cpp 中使用 InitiateSystemShutdownExW（不再依赖 shutdown.exe）', () {
+      expect(mainCpp, contains('method == "restart"'));
+      expect(mainCpp, contains('NativeRestart()'));
+      expect(mainCpp, contains('InitiateSystemShutdownExW'));
+    });
 
     test('cancelShutdown 在 main.cpp 中有 handler', () {
       expect(mainCpp, contains('method == "cancelShutdown"'));

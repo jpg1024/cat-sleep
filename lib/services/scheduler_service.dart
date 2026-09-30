@@ -292,9 +292,13 @@ class SchedulerService {
   /// 周期任务（workday / specificTime）执行后必须保留任务状态，
   /// 即使暂时找不到下次执行时间也不能 `_clearTask()`——任务配置
   /// 仍需保留，因为后续还有执行机会。
+  ///
+  /// 安全兜底：确保下次触发时间严格在未来。如果 `_calculateNextTrigger`
+  /// 返回的时间已过期（如刚执行完的同一时间点），按周期推进直到找到
+  /// 真正的未来时间，防止 Timer(0) 立即触发导致重复执行。
   Future<void> _reschedule(TaskConfig config) async {
     _cancelTimers();
-    final nextTime = await _calculateNextTrigger(config);
+    var nextTime = await _calculateNextTrigger(config);
 
     if (nextTime == null) {
       await LogService.write(
@@ -302,17 +306,38 @@ class SchedulerService {
         'keeping task alive for retry (type=${config.taskType.name}, '
         'mode=${config.scheduleMode.name})',
       );
-      // 不删除任务：周期任务还有后续执行机会，保留配置等待下次重试
       _nextTriggerTime = null;
       _onStatusChanged?.call();
       return;
     }
 
-    _taskStartTime = DateTime.now();
-    _nextTriggerTime = nextTime;
-    _armTimers(config, nextTime);
+    final now = DateTime.now();
+    DateTime resolved = nextTime;
+    if (!resolved.isAfter(now)) {
+      final original = resolved;
+      for (int i = 0; i < _maxSearchSteps; i++) {
+        if (config.scheduleMode == ScheduleMode.workday) {
+          resolved = resolved.add(const Duration(days: 1));
+          if (await _isWorkdayTriggerDay(resolved, config) &&
+              resolved.isAfter(now)) {
+            break;
+          }
+        } else {
+          resolved = _advance(resolved, config);
+          if (resolved.isAfter(now)) break;
+        }
+      }
+      await LogService.write(
+        '[SchedulerService] Reschedule: advanced past trigger '
+        '($original -> $resolved)',
+      );
+    }
 
-    await LogService.write('[SchedulerService] Rescheduled next run at $nextTime');
+    _taskStartTime = DateTime.now();
+    _nextTriggerTime = resolved;
+    _armTimers(config, resolved);
+
+    await LogService.write('[SchedulerService] Rescheduled next run at $resolved');
     _onStatusChanged?.call();
   }
 
