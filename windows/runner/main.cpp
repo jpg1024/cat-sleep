@@ -62,15 +62,37 @@ static bool ExecuteCommand(const std::wstring& cmd, DWORD timeoutMs,
 
 // Native shutdown/restart via Windows API -- avoids spawning shutdown.exe
 // through cmd.exe, which produced spurious non-zero exit codes (e.g. 1271)
-// on some systems. InitiateSystemShutdownExW is available to standard users
-// (they hold SeShutdownPrivilege by default) and returns immediately when
-// the timeout is 0.
+// on some systems. InitiateSystemShutdownExW requires SeShutdownPrivilege
+// to be explicitly enabled in the process token (shutdown.exe does this
+// internally). Standard users hold this privilege but it is disabled by
+// default; AdjustTokenPrivileges enables it before the API call.
+static bool EnableShutdownPrivilege() {
+  HANDLE hToken;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                        &hToken)) return false;
+  LUID luid;
+  if (!LookupPrivilegeValueW(nullptr, L"SeShutdownPrivilege", &luid)) {
+    CloseHandle(hToken);
+    return false;
+  }
+  TOKEN_PRIVILEGES tp = {};
+  tp.PrivilegeCount = 1;
+  tp.Privileges[0].Luid = luid;
+  tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+  bool ok = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr)
+            && GetLastError() != ERROR_NOT_ALL_ASSIGNED;
+  CloseHandle(hToken);
+  return ok;
+}
+
 static bool NativeShutdown() {
+  if (!EnableShutdownPrivilege()) return false;
   return InitiateSystemShutdownExW(nullptr, nullptr, 0, TRUE, FALSE,
                                    SHTDN_REASON_FLAG_PLANNED) != 0;
 }
 
 static bool NativeRestart() {
+  if (!EnableShutdownPrivilege()) return false;
   return InitiateSystemShutdownExW(nullptr, nullptr, 0, TRUE, TRUE,
                                    SHTDN_REASON_FLAG_PLANNED) != 0;
 }
